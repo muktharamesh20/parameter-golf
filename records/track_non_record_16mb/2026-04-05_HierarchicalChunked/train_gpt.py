@@ -683,7 +683,7 @@ class HierarchicalGPT(nn.Module):
 
         # Global input: causally shifted chunk-boundary embeddings with learned BOS prefix.
         # global_input[:, i, :] gives context for chunk i derived from chunks 0..i-1.
-        chunk_first = x_embed[:, ::G, :]         # [B, num_chunks, global_dim]
+        chunk_first = x_embed.reshape(B, num_chunks, G, self.global_dim)[:, :, 0, :]  # [B, num_chunks, global_dim]
         bos = self.global_bos.to(x_embed.dtype)[None, None, :].expand(B, 1, -1)
         global_input = torch.cat([bos, chunk_first[:, :-1, :]], dim=1)  # [B, num_chunks, global_dim]
         global_input = F.rms_norm(global_input, (global_input.size(-1),))
