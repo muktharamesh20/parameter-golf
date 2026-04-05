@@ -1,13 +1,22 @@
 {
   "author": "Muktha Ramesh",
-  "github_id": "muktharamesh",
+  "github_id": "muktharamesh20",
   "name": "Hierarchical Chunked Transformer (H-net Inspired)",
   "blurb": "MegaByte-style hierarchical transformer: 7-layer global model (448-dim) over T/G=128 chunk tokens + 3-layer local model (256-dim) over G=16 token windows in parallel. First hierarchical chunked architecture in this competition. Standard eval (not sliding window). ~15.2M params, int8+zlib.",
   "date": "2026-04-05",
   "track": "non_record_16mb",
-  "val_loss": null,
-  "val_bpb": null,
+  "val_loss": 4.77396831,
+  "val_bpb": 2.82741294,
   "seeds": [1337],
+  "seed_results": {
+    "1337": {
+      "val_loss": 4.77396831,
+      "val_bpb": 2.82741294,
+      "artifact_bytes": 14239190,
+      "steps": 9124,
+      "step_avg_ms": 65.76
+    }
+  },
   "hardware": "8xH100 80GB SXM",
   "architecture": "hierarchical_chunked_transformer",
   "chunk_size": 16,
@@ -15,5 +24,7 @@
   "global_layers": 7,
   "local_dim": 256,
   "local_layers": 3,
-  "notes": "Non-record submission. Fill in val_bpb and artifact_bytes after training. Standard eval (no sliding window). First H-net inspired submission in Parameter Golf."
+  "bytes_total": 14239190,
+  "bytes_code": 46418,
+  "notes": "Non-record submission. Standard eval (no sliding window). First H-net inspired submission in Parameter Golf. val_bpb is after int8+zlib quantization roundtrip."
 }
