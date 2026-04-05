@@ -827,7 +827,7 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     # dynamic=True to handle variable batch sizes between train and eval
-    compiled_model = torch.compile(base_model, dynamic=True)
+    compiled_model = base_model  # skip torch.compile: Rotary cache + dynamic local batch sizes cause dynamo issues
     model: nn.Module = (
         DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
         if distributed else compiled_model
