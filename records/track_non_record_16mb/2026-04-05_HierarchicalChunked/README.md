@@ -122,14 +122,27 @@ trains stably, fits in 16MB, and produces reasonable val_bpb. Foundation for fur
 segmentation" of the H-net paper (goombalab/hnet, arXiv:2507.07955) is a follow-up direction.
 The key difference: H-nets learn WHERE to chunk; this submission uses fixed G=16.
 
+## v2 Updates (Proven Tricks)
+
+The following proven competition techniques have been integrated:
+
+| Technique | Expected BPB gain |
+|-----------|------------------|
+| LeakyReLU(0.5)² in MLP | −0.003 |
+| Partial RoPE (rope_dims=16) | −0.002 |
+| LN Scale (1/√layer+1) | −0.001 |
+| BigramHash 1536×64 | −0.010 |
+| EMA weight averaging (decay=0.997) | −0.003 |
+| Sliding window eval (stride=64) | −0.032 |
+| Over-scheduled warmdown (4000 iters) | −0.002 |
+| **Total expected** | **~−0.053** |
+
 ## Next Steps
 
-1. Add sliding-window eval (stride must be multiple of G)
-2. Tune chunk size G (try G=8, G=32)
-3. Tune global/local dim ratio (more global capacity may help)
-4. Add BigramHash to local model (bigram stats within chunks)
-5. Implement dynamic chunking: add a lightweight "should I chunk here?" gate
-6. Try G as a learnable parameter via straight-through estimator
+1. Tune chunk size G (try G=8, G=32)
+2. Tune global/local dim ratio (more global capacity may help)
+3. Implement dynamic chunking: add a lightweight "should I chunk here?" gate
+4. Try G as a learnable parameter via straight-through estimator
 
 ## Results
 

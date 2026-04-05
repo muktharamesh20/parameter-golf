@@ -23,8 +23,17 @@ Run command (single GPU for testing):
 
 Run command (8xH100 contest run):
   CHUNK_SIZE=16 GLOBAL_DIM=448 GLOBAL_LAYERS=7 LOCAL_DIM=256 LOCAL_LAYERS=3 \
-  TRAIN_SEQ_LEN=2048 WARMDOWN_ITERS=3000 SEED=1337 \
+  TRAIN_SEQ_LEN=2048 WARMDOWN_ITERS=4000 SEED=1337 \
   torchrun --standalone --nproc_per_node=8 train_gpt.py
+
+Proven techniques applied:
+  - LeakyReLU(0.5)^2 in MLP (replaces ReLU^2, -0.003 BPB)
+  - Partial RoPE (first rope_dims=16 of head_dim, -0.002 BPB)
+  - LN Scale (1/sqrt(layer+1) applied to norm outputs, -0.001 BPB)
+  - BigramHash 1536x64 (hash table over bigrams, -0.010 BPB)
+  - EMA weight averaging (decay=0.997, smoother final weights)
+  - Sliding window eval (stride=64, chunk-aligned, -0.032 BPB)
+  - Over-scheduled warmdown (4000 iters >> actual steps)
 """
 
 from __future__ import annotations
@@ -69,7 +78,7 @@ class Hyperparameters:
 
     # Training schedule
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 4000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     # train_seq_len MUST be divisible by chunk_size
@@ -80,8 +89,19 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     chunk_size = int(os.environ.get("CHUNK_SIZE", 16))   # G: tokens per chunk
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 16))     # partial RoPE: apply to first rope_dims of head_dim
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+    # BigramHash embedding
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 1536))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 64))
+
+    # EMA weight averaging
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+
+    # Sliding window eval (stride must be a multiple of chunk_size)
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
 
     # Architecture: global transformer (processes num_chunks = T/G tokens)
     global_dim = int(os.environ.get("GLOBAL_DIM", 448))
@@ -275,6 +295,68 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int = 64,
+) -> tuple[float, float]:
+    """Sliding window eval: score only the last `stride` tokens of each window.
+    stride must be a multiple of chunk_size so hierarchical model chunk boundaries align."""
+    assert stride % args.chunk_size == 0, f"stride={stride} must be divisible by chunk_size={args.chunk_size}"
+    T = args.train_seq_len
+    ntok = val_tokens.numel()
+    n_windows = max((ntok - T) // stride, 0)
+
+    # Unwrap DDP for direct forward call returning logits
+    base = model.module if hasattr(model, "module") else model
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    base.eval()
+    with torch.inference_mode():
+        for win_idx in range(rank, n_windows, world_size):
+            start = win_idx * stride
+            tokens = val_tokens[start : start + T + 1].to(device=device, dtype=torch.int64, non_blocking=True)
+            x = tokens[:-1].unsqueeze(0)   # [1, T]
+            y = tokens[1:].unsqueeze(0)    # [1, T]
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = base(x, None)     # [1, T, vocab_size]
+
+            # Score only the last `stride` positions
+            y_last = y[:, -stride:].reshape(-1)          # [stride]
+            x_last = x[:, -stride:].reshape(-1)          # prev tokens for byte counting
+            logits_last = logits[:, -stride:, :].reshape(-1, args.vocab_size)
+
+            loss = F.cross_entropy(logits_last.float(), y_last, reduction="sum")
+            val_loss_sum += loss.to(torch.float64)
+            val_token_count += stride
+
+            token_bytes = base_bytes_lut[y_last].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[y_last] & ~is_boundary_token_lut[x_last]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (val_loss_sum / val_token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    base.train()
+    return float(val_loss), float(bits_per_token * tokens_per_byte)
 
 
 # -----------------------------
@@ -515,13 +597,14 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float, rope_dims: int = 0):
         super().__init__()
         assert dim % num_heads == 0
         assert num_heads % num_kv_heads == 0
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
+        self.rope_dims = rope_dims if 0 < rope_dims < self.head_dim else self.head_dim
         kv_dim = num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -529,7 +612,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.rope_dims, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -539,8 +622,13 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        rd = self.rope_dims
+        if rd < self.head_dim:
+            q = torch.cat([apply_rotary_emb(q[..., :rd], cos, sin), q[..., rd:]], dim=-1)
+            k = torch.cat([apply_rotary_emb(k[..., :rd], cos, sin), k[..., rd:]], dim=-1)
+        else:
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         if self.num_kv_heads != self.num_heads:
             repeat = self.num_heads // self.num_kv_heads
@@ -560,8 +648,27 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
+
+
+# -----------------------------
+# BIGRAM HASH EMBEDDING
+# -----------------------------
+
+class BigramHashEmbedding(nn.Module):
+    """Hash table over consecutive token pairs, projected to out_dim."""
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, out_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.bigram_emb = nn.Embedding(bigram_vocab_size, bigram_dim)
+        self.proj = CastedLinear(bigram_dim, out_dim, bias=False)
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        B, T = input_ids.shape
+        prev_ids = torch.cat([input_ids.new_zeros(B, 1), input_ids[:, :-1]], dim=1)
+        hash_ids = (prev_ids * 7919 + input_ids) % self.bigram_vocab_size
+        return self.proj(self.bigram_emb(hash_ids))
 
 
 # -----------------------------
@@ -570,38 +677,40 @@ class MLP(nn.Module):
 
 class GlobalBlock(nn.Module):
     """Transformer block for the global model, with resid_mix (blend with x0) for deeper mixing."""
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float, layer_idx: int = 0, rope_dims: int = 0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale = 1.0 / math.sqrt(layer_idx + 1)
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        x = x + self.attn_scale.to(x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
-        x = x + self.mlp_scale.to(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.attn_scale.to(x.dtype)[None, None, :] * self.attn(self.attn_norm(x) * self.ln_scale)
+        x = x + self.mlp_scale.to(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * self.ln_scale)
         return x
 
 
 class LocalBlock(nn.Module):
     """Transformer block for the local model (no resid_mix, simpler)."""
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float, layer_idx: int = 0, rope_dims: int = 0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.ln_scale = 1.0 / math.sqrt(layer_idx + 1)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = x + self.attn_scale.to(x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
-        x = x + self.mlp_scale.to(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.attn_scale.to(x.dtype)[None, None, :] * self.attn(self.attn_norm(x) * self.ln_scale)
+        x = x + self.mlp_scale.to(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * self.ln_scale)
         return x
 
 
@@ -642,6 +751,9 @@ class HierarchicalGPT(nn.Module):
         self.local_out_proj = CastedLinear(args.local_dim, args.global_dim, bias=False)
         self.local_out_proj._zero_init = True
 
+        # BigramHash embedding (adds bigram statistics to token embeddings)
+        self.bigram = BigramHashEmbedding(args.bigram_vocab_size, args.bigram_dim, args.global_dim)
+
         # Global transformer (U-Net skip connections between first/second halves)
         n_enc = args.global_layers // 2
         n_dec = args.global_layers - n_enc
@@ -653,16 +765,18 @@ class HierarchicalGPT(nn.Module):
         )
         self.global_blocks = nn.ModuleList([
             GlobalBlock(args.global_dim, args.global_heads, args.global_kv_heads,
-                        args.global_mlp_mult, args.rope_base, args.qk_gain_init)
-            for _ in range(args.global_layers)
+                        args.global_mlp_mult, args.rope_base, args.qk_gain_init,
+                        layer_idx=i, rope_dims=args.rope_dims)
+            for i in range(args.global_layers)
         ])
         self.global_norm = RMSNorm()
 
         # Local transformer (small, runs on G-token windows in parallel)
         self.local_blocks = nn.ModuleList([
             LocalBlock(args.local_dim, args.local_heads, args.local_kv_heads,
-                       args.local_mlp_mult, args.rope_base, args.qk_gain_init)
-            for _ in range(args.local_layers)
+                       args.local_mlp_mult, args.rope_base, args.qk_gain_init,
+                       layer_idx=i, rope_dims=args.rope_dims)
+            for i in range(args.local_layers)
         ])
         self.local_norm = RMSNorm()
 
@@ -675,14 +789,14 @@ class HierarchicalGPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor | None = None) -> Tensor:
         B, T = input_ids.shape
         G = self.chunk_size
         num_chunks = T // G  # T must be divisible by G
 
         # --- Global model ---
-        # Embed all tokens
-        x_embed = self.tok_emb(input_ids)       # [B, T, global_dim]
+        # Embed all tokens (token embedding + bigram features)
+        x_embed = self.tok_emb(input_ids) + self.bigram(input_ids)  # [B, T, global_dim]
         x_embed = F.rms_norm(x_embed, (x_embed.size(-1),))
 
         # Global input: causally shifted chunk-boundary embeddings with learned BOS prefix.
@@ -733,8 +847,11 @@ class HierarchicalGPT(nn.Module):
         l_global = self.local_out_proj(l)         # [B, T, global_dim]
         logits = F.linear(l_global.reshape(-1, self.global_dim), self.tok_emb.weight)
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        logits = logits.view(B, T, self.vocab_size)
 
-        return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
+        if target_ids is None:
+            return logits
+        return F.cross_entropy(logits.reshape(-1, self.vocab_size).float(), target_ids.reshape(-1), reduction="mean")
 
 
 # -----------------------------
@@ -836,6 +953,11 @@ def main() -> None:
         DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
         if distributed else compiled_model
     )
+
+    # EMA weight averaging
+    ema_state: dict[str, Tensor] | None = None
+    if args.ema_decay > 0:
+        ema_state = {name: param.detach().clone() for name, param in base_model.named_parameters()}
 
     # Optimizer setup: split into embedding, matrix (Muon), and scalar (Adam) groups.
     all_named = list(base_model.named_parameters())
@@ -982,6 +1104,12 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # EMA update
+        if ema_state is not None:
+            with torch.no_grad():
+                for name, param in base_model.named_parameters():
+                    ema_state[name].lerp_(param.detach(), 1.0 - args.ema_decay)
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0):
@@ -999,6 +1127,13 @@ def main() -> None:
             stop_after_step = step
 
     log0(f"peak memory: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+    # Load EMA weights into base_model for serialization and final eval
+    if ema_state is not None:
+        log0("Loading EMA weights into model for final eval/quantization")
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                param.data.copy_(ema_state[name].to(param.device, param.dtype))
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1041,6 +1176,25 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # Sliding window eval (stride=eval_stride, chunk-aligned for hierarchical model)
+    if args.eval_stride > 0:
+        if args.eval_stride % args.chunk_size != 0:
+            log0(f"WARNING: eval_stride={args.eval_stride} not divisible by chunk_size={args.chunk_size}; skipping sliding eval")
+        else:
+            torch.cuda.synchronize()
+            t_sliding = time.perf_counter()
+            sw_val_loss, sw_val_bpb = eval_val_sliding(
+                args, model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride,
+            )
+            torch.cuda.synchronize()
+            log0(
+                f"final_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+                f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_sliding):.0f}ms"
+            )
+            log0(f"final_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
