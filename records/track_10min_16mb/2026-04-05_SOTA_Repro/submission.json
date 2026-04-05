@@ -1,0 +1,13 @@
+{
+  "author": "Muktha Ramesh",
+  "github_id": "muktharamesh",
+  "name": "SOTA Repro — AR Self-Gen GPTQ + XSA-all + BigramHash 3072x112",
+  "blurb": "Reproduction of current SOTA (abaybektursun PR #1019): Full Hessian GPTQ with AR self-generated calibration, XSA on all 11 layers, BigramHash(3072,112), LeakyReLU^2, Parallel Muon, LZMA9.",
+  "date": "2026-04-05",
+  "track": "10min_16mb",
+  "val_loss": null,
+  "val_bpb": null,
+  "seeds": [1337, 42, 2025],
+  "hardware": "8xH100 80GB SXM",
+  "notes": "Reproduction run — fill in val_bpb and logs after training."
+}
